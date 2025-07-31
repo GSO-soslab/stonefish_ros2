@@ -20,7 +20,7 @@
 //  stonefish_ros2
 //
 //  Created by Patryk Cieslak on 02/10/23.
-//  Copyright (c) 2023-2024 Patryk Cieslak. All rights reserved.
+//  Copyright (c) 2023-2025 Patryk Cieslak. All rights reserved.
 //
 
 #ifndef __Stonefish_ROS2SimulationManager__
@@ -32,6 +32,7 @@
 #include "std_srvs/srv/set_bool.hpp"
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "geometry_msgs/msg/vector3.hpp"
 #include "geometry_msgs/msg/transform.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -60,11 +61,17 @@ namespace sf
     class SuctionCup;
     class ColorCamera;
 	class DepthCamera;
+    class ThermalCamera;
+    class OpticalFlowCamera;
+    class SegmentationCamera;
+    class EventBasedCamera;
     class Multibeam2;
     class FLS;
     class SSS;
     class MSIS;
-    class Joint;
+    class FixedJoint;
+    class Light;
+    class Comm;
 
     struct ROS2Robot
 	{
@@ -101,6 +108,10 @@ namespace sf
 		virtual void SimulationStepCompleted(Scalar timeStep);
         virtual void ColorCameraImageReady(ColorCamera* cam);
 	    virtual void DepthCameraImageReady(DepthCamera* cam);
+        virtual void ThermalCameraImageReady(ThermalCamera* cam);
+        virtual void OpticalFlowCameraImageReady(OpticalFlowCamera* cam);
+        virtual void SegmentationCameraImageReady(SegmentationCamera* cam);
+        virtual void EventBasedCameraOutputReady(EventBasedCamera* cam);
 		virtual void Multibeam2ScanReady(Multibeam2* mb);
 		virtual void FLSScanReady(FLS* fls);
 		virtual void SSSScanReady(SSS* sss);
@@ -116,6 +127,7 @@ namespace sf
         std::map<std::string, rclcpp::SubscriptionBase::SharedPtr>& getSubscribers();
         std::shared_ptr<image_transport::ImageTransport> getImageTransportHandle();
         std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::CameraInfo::SharedPtr>>& getCameraMsgPrototypes();
+        std::map<std::string, std::tuple<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::CameraInfo::SharedPtr, sensor_msgs::msg::Image::SharedPtr>>& getDualImageCameraMsgPrototypes();
 		std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::Image::SharedPtr>>& getSonarMsgPrototypes();        
 
         void EnableCurrentsService(const std_srvs::srv::Trigger::Request::SharedPtr req, 
@@ -154,9 +166,12 @@ namespace sf
                                                             ServoControlMode mode, const std::string& jointName);
         void JointGroupCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg,  std::shared_ptr<ROS2Robot> robot, 
                                                             ServoControlMode mode, const std::vector<std::string>& jointNames);
-        void JointBreakService(const std_srvs::srv::Trigger::Request::SharedPtr req, 
-                            std_srvs::srv::Trigger::Response::SharedPtr res, Joint* j);
-        
+        void GlueService(const std_srvs::srv::SetBool::Request::SharedPtr req,
+                            std_srvs::srv::SetBool::Response::SharedPtr res, FixedJoint* fix);
+        void LightService(const std_srvs::srv::SetBool::Request::SharedPtr req,
+                            std_srvs::srv::SetBool::Response::SharedPtr res, Light* light);
+        void CommCallback(const std_msgs::msg::String::SharedPtr msg, Comm* comm);
+
     protected:
         std::string scenarioPath_;
         std::vector<std::shared_ptr<ROS2Robot>> rosRobots_;
@@ -170,7 +185,9 @@ namespace sf
         std::map<std::string, image_transport::Publisher> imgPubs_;
         std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, 
             sensor_msgs::msg::CameraInfo::SharedPtr>> cameraMsgPrototypes_;
-		std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, 
+        std::map<std::string, std::tuple<sensor_msgs::msg::Image::SharedPtr,
+            sensor_msgs::msg::CameraInfo::SharedPtr, sensor_msgs::msg::Image::SharedPtr>> dualImageCameraMsgPrototypes_;
+        std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, 
             sensor_msgs::msg::Image::SharedPtr>> sonarMsgPrototypes_;
     };
 }

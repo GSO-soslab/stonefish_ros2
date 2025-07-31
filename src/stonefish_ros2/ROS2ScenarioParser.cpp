@@ -20,7 +20,7 @@
 //  stonefish_ros2
 //
 //  Created by Patryk Cieslak on 02/10/23.
-//  Copyright (c) 2023 Patryk Cieslak. All rights reserved.
+//  Copyright (c) 2025 Patryk Cieslak. All rights reserved.
 //
 
 #include "stonefish_ros2/ROS2ScenarioParser.h"
@@ -56,6 +56,8 @@
 #include "stonefish_ros2/srv/sonar_settings.hpp"
 #include "stonefish_ros2/srv/sonar_settings2.hpp"
 #include "image_transport/image_transport.hpp"
+#include "stonefish_ros2/msg/event.hpp"
+#include "stonefish_ros2/msg/event_array.hpp"
 
 #include <Stonefish/core/Robot.h>
 #include <Stonefish/entities/AnimatedEntity.h>
@@ -74,6 +76,10 @@
 #include <Stonefish/sensors/ScalarSensor.h>
 #include <Stonefish/sensors/vision/ColorCamera.h>
 #include <Stonefish/sensors/vision/DepthCamera.h>
+#include <Stonefish/sensors/vision/ThermalCamera.h>
+#include <Stonefish/sensors/vision/OpticalFlowCamera.h>
+#include <Stonefish/sensors/vision/SegmentationCamera.h>
+#include <Stonefish/sensors/vision/EventBasedCamera.h>
 #include <Stonefish/sensors/vision/Multibeam2.h>
 #include <Stonefish/sensors/vision/FLS.h>
 #include <Stonefish/sensors/vision/SSS.h>
@@ -689,6 +695,7 @@ Sensor* ROS2ScenarioParser::ParseSensor(XMLElement* element, const std::string& 
         std::map<std::string, rclcpp::ServiceBase::SharedPtr>& srvs = sim->getServices();
         std::map<std::string, image_transport::Publisher>& img_pubs = sim->getImagePublishers();
         std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::CameraInfo::SharedPtr>>& camMsgProto = sim->getCameraMsgPrototypes();
+        std::map<std::string, std::tuple<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::CameraInfo::SharedPtr, sensor_msgs::msg::Image::SharedPtr>>& dualCamMsgProto = sim->getDualImageCameraMsgPrototypes();
         std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::Image::SharedPtr>>& sonarMsgProto = sim->getSonarMsgPrototypes();
         
         //Publishing info
@@ -867,6 +874,47 @@ Sensor* ROS2ScenarioParser::ParseSensor(XMLElement* element, const std::string& 
                     }
                         break;
 
+                    case VisionSensorType::THERMAL_CAMERA:
+                    {
+                        img_pubs[sensorName] = it->advertise(topicStr + "/image_raw", queueSize);
+                        img_pubs[sensorName + "/display"] = it->advertise(topicStr + "/image_color", queueSize);
+                        pubs[sensorName + "/info"] = nh_->create_publisher<sensor_msgs::msg::CameraInfo>(topicStr + "/camera_info", queueSize);                        
+                        ThermalCamera* cam = (ThermalCamera*)sens;
+                        cam->InstallNewDataHandler(std::bind(&ROS2SimulationManager::ThermalCameraImageReady, sim, _1));
+                        dualCamMsgProto[sensorName] = ROS2Interface::GenerateThermalCameraMsgPrototypes(cam);
+                    }
+                        break;
+
+                    case VisionSensorType::OPTICAL_FLOW_CAMERA:
+                    {
+                        img_pubs[sensorName] = it->advertise(topicStr + "/image_raw", queueSize);
+                        img_pubs[sensorName + "/display"] = it->advertise(topicStr + "/image_color", queueSize);
+                        pubs[sensorName + "/info"] = nh_->create_publisher<sensor_msgs::msg::CameraInfo>(topicStr + "/camera_info", queueSize);                        
+                        OpticalFlowCamera* cam = (OpticalFlowCamera*)sens;
+                        cam->InstallNewDataHandler(std::bind(&ROS2SimulationManager::OpticalFlowCameraImageReady, sim, _1));
+                        dualCamMsgProto[sensorName] = ROS2Interface::GenerateOpticalFlowCameraMsgPrototypes(cam);
+                    }
+                        break;
+
+                    case VisionSensorType::SEGMENTATION_CAMERA:
+                    {
+                        img_pubs[sensorName] = it->advertise(topicStr + "/image_raw", queueSize);
+                        img_pubs[sensorName + "/display"] = it->advertise(topicStr + "/image_color", queueSize);
+                        pubs[sensorName + "/info"] = nh_->create_publisher<sensor_msgs::msg::CameraInfo>(topicStr + "/camera_info", queueSize);                        
+                        SegmentationCamera* cam = (SegmentationCamera*)sens;
+                        cam->InstallNewDataHandler(std::bind(&ROS2SimulationManager::SegmentationCameraImageReady, sim, _1));
+                        dualCamMsgProto[sensorName] = ROS2Interface::GenerateSegmentationCameraMsgPrototypes(cam);
+                    }
+                        break;
+
+                    case VisionSensorType::EVENT_BASED_CAMERA:
+                    {
+                        pubs[sensorName] = nh_->create_publisher<stonefish_ros2::msg::EventArray>(topicStr, queueSize);
+                        EventBasedCamera* cam = (EventBasedCamera*)sens;
+                        cam->InstallNewDataHandler(std::bind(&ROS2SimulationManager::EventBasedCameraOutputReady, sim, _1));
+                    }
+                        break;
+
                     case VisionSensorType::MULTIBEAM2:
                     {
                         pubs[sensorName] = nh_->create_publisher<sensor_msgs::msg::PointCloud2>(topicStr, queueSize);
@@ -914,6 +962,7 @@ Sensor* ROS2ScenarioParser::ParseSensor(XMLElement* element, const std::string& 
                         srvs[sensorName] = nh_->create_service<stonefish_ros2::srv::SonarSettings2>(topicStr + "/settings", callbackFunc);
                         img_pubs[sensorName] = it->advertise(topicStr + "/image", queueSize);
                         img_pubs[sensorName + "/display"] = it->advertise(topicStr + "/display", queueSize);
+                        pubs[sensorName + "/beam"] = nh_->create_publisher<sensor_msgs::msg::LaserScan>(topicStr + "/last_beam", queueSize);
                     }
                         break;
 
@@ -950,26 +999,80 @@ Comm* ROS2ScenarioParser::ParseComm(XMLElement* element, const std::string& name
     {
         ROS2SimulationManager* sim = (ROS2SimulationManager*)getSimulationManager();
         std::map<std::string, rclcpp::PublisherBase::SharedPtr>& pubs = sim->getPublishers();
+        std::map<std::string, rclcpp::SubscriptionBase::SharedPtr>& subs = sim->getSubscribers();
         std::string commName = comm->getName();
 
         //Publishing info
         XMLElement* item;
-        const char* topic = nullptr;
-        if((item = element->FirstChildElement("ros_publisher")) == nullptr
-            || item->QueryStringAttribute("topic", &topic) != XML_SUCCESS)
+        const char* pubTopic = nullptr;
+        const char* subTopic = nullptr;
+        if((item = element->FirstChildElement("ros_publisher")) != nullptr)
         {
-            return comm;
+            item->QueryStringAttribute("topic", &pubTopic);
         }
 
-        std::string topicStr(topic);
+        if((item = element->FirstChildElement("ros_subscriber")) != nullptr)
+        {
+            item->QueryStringAttribute("topic", &subTopic);
+        }
+
+        if(pubTopic == nullptr && subTopic == nullptr)
+            return comm;
 
         //Generate publishers for different comm types
         switch(comm->getType())
         {
+            case CommType::ACOUSTIC:
+            {
+                if(pubTopic != nullptr)
+                {
+                    std::string topicStr {pubTopic};
+                    pubs[commName] = nh_->create_publisher<std_msgs::msg::String>(topicStr + "/received_data", 10);
+                }
+                if(subTopic != nullptr)
+                {
+                    std::string topicStr {subTopic};
+                    std::function<void(const std_msgs::msg::String::SharedPtr msg)> callbackFunc =
+                        std::bind(&ROS2SimulationManager::CommCallback, sim, _1, comm);
+                    subs[commName + "/data_to_send"] = nh_->create_subscription<std_msgs::msg::String>(topicStr + "/data_to_send", 1, callbackFunc);
+                }
+            }
+                break;
+
             case CommType::USBL:
             {
-                pubs[commName] = nh_->create_publisher<visualization_msgs::msg::MarkerArray>(topicStr, 10);
-                pubs[commName + "/beacon_info"] = nh_->create_publisher<stonefish_ros2::msg::BeaconInfo>(topicStr + "/beacon_info", 10);
+                if(pubTopic != nullptr)
+                {
+                    std::string topicStr {pubTopic};
+                    pubs[commName] = nh_->create_publisher<visualization_msgs::msg::MarkerArray>(topicStr, 10);
+                    pubs[commName + "/beacon_info"] = nh_->create_publisher<stonefish_ros2::msg::BeaconInfo>(topicStr + "/beacon_info", 10);
+                    pubs[commName + "/received_data"] = nh_->create_publisher<std_msgs::msg::String>(topicStr + "/received_data", 10);
+                }
+                if(subTopic != nullptr)
+                {
+                    std::string topicStr {subTopic};
+                    std::function<void(const std_msgs::msg::String::SharedPtr msg)> callbackFunc =
+                        std::bind(&ROS2SimulationManager::CommCallback, sim, _1, comm);
+                    subs[commName + "/data_to_send"] = nh_->create_subscription<std_msgs::msg::String>(topicStr + "/data_to_send", 1, callbackFunc);
+                }
+            }
+                break;
+
+            case CommType::OPTICAL:
+            {
+                if(pubTopic != nullptr)
+                {
+                    std::string topicStr {pubTopic};
+                    pubs[commName] = nh_->create_publisher<std_msgs::msg::Float64>(topicStr + "/reception_quality", 10);
+                    pubs[commName + "/received_data"] = nh_->create_publisher<std_msgs::msg::String>(topicStr + "/received_data", 10);
+                }
+                if(subTopic != nullptr)
+                {
+                    std::string topicStr {subTopic};
+                    std::function<void(const std_msgs::msg::String::SharedPtr msg)> callbackFunc =
+                        std::bind(&ROS2SimulationManager::CommCallback, sim, _1, comm);
+                    subs[commName + "/data_to_send"] = nh_->create_subscription<std_msgs::msg::String>(topicStr + "/data_to_send", 1, callbackFunc);
+                }
             }
                 break;
 
@@ -987,7 +1090,6 @@ Light* ROS2ScenarioParser::ParseLight(XMLElement* element, const std::string& na
     if(l != nullptr)
     {
         ROS2SimulationManager* sim = (ROS2SimulationManager*)getSimulationManager();
-        std::map<std::string, rclcpp::SubscriptionBase::SharedPtr>& subs = sim->getSubscribers();
         XMLElement* item;
 
         //Online update of light origin frame
@@ -995,9 +1097,21 @@ Light* ROS2ScenarioParser::ParseLight(XMLElement* element, const std::string& na
         if((item = element->FirstChildElement("ros_subscriber")) != nullptr
             && item->QueryStringAttribute("origin", &originTopic) == XML_SUCCESS)
         {
+            std::map<std::string, rclcpp::SubscriptionBase::SharedPtr>& subs = sim->getSubscribers();
             std::function<void(const geometry_msgs::msg::Transform::SharedPtr msg)> callbackFunc =
                         std::bind(&ROS2SimulationManager::ActuatorOriginCallback, sim, _1, (Actuator*)l);
             subs[l->getName()] = nh_->create_subscription<geometry_msgs::msg::Transform>(std::string(originTopic), 10, callbackFunc);
+        }
+
+        //Service for switching the light
+        const char* switchTopic = nullptr;
+        if((item = element->FirstChildElement("ros_service")) != nullptr
+            && item->QueryStringAttribute("topic", &switchTopic) == XML_SUCCESS)
+        {
+            std::map<std::string, rclcpp::ServiceBase::SharedPtr>& srvs = sim->getServices();
+            std::function<void(const std_srvs::srv::SetBool::Request::SharedPtr req, std_srvs::srv::SetBool::Response::SharedPtr res)> 
+                callbackFunc = std::bind(&ROS2SimulationManager::LightService, sim, _1, _2, l);
+            srvs[l->getName()] = nh_->create_service<std_srvs::srv::SetBool>(std::string(switchTopic), callbackFunc);
         }
     }
     return l;
@@ -1030,7 +1144,7 @@ bool ROS2ScenarioParser::ParseContact(XMLElement* element)
 }
 
 FixedJoint* ROS2ScenarioParser::ParseGlue(XMLElement* element)
-{
+{   
     FixedJoint* glue = ScenarioParser::ParseGlue(element);
     if(glue != nullptr)
     {
@@ -1044,9 +1158,9 @@ FixedJoint* ROS2ScenarioParser::ParseGlue(XMLElement* element)
 
         ROS2SimulationManager* sim = (ROS2SimulationManager*)getSimulationManager();
         std::map<std::string, rclcpp::ServiceBase::SharedPtr>& srvs = sim->getServices();
-        std::function<void(const std_srvs::srv::Trigger::Request::SharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)> callbackFunc =
-            std::bind(&ROS2SimulationManager::JointBreakService, sim, _1, _2, glue);
-        srvs[glue->getName()] = nh_->create_service<std_srvs::srv::Trigger>(std::string(topic), callbackFunc);
+        std::function<void(const std_srvs::srv::SetBool::Request::SharedPtr req, std_srvs::srv::SetBool::Response::SharedPtr res)> callbackFunc =
+            std::bind(&ROS2SimulationManager::GlueService, sim, _1, _2, glue);
+        srvs[glue->getName()] = nh_->create_service<std_srvs::srv::SetBool>(std::string(topic), callbackFunc);
     }
     return glue;
 }

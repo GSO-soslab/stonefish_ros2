@@ -20,7 +20,7 @@
 //  stonefish_ros2
 //
 //  Created by Patryk Cieslak on 02/10/23.
-//  Copyright (c) 2023-2024 Patryk Cieslak. All rights reserved.
+//  Copyright (c) 2023-2025 Patryk Cieslak. All rights reserved.
 //
 
 #include "stonefish_ros2/ROS2SimulationManager.h"
@@ -30,13 +30,14 @@
 #include "stonefish_ros2/msg/thruster_state.hpp"
 #include "stonefish_ros2/msg/debug_physics.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "geometry_msgs/msg/wrench_stamped.hpp"
 
 #include <Stonefish/entities/animation/ManualTrajectory.h>
 #include <Stonefish/entities/forcefields/Uniform.h>
 #include <Stonefish/entities/forcefields/Jet.h>
-#include <Stonefish/joints/Joint.h>
+#include <Stonefish/joints/FixedJoint.h>
 #include <Stonefish/sensors/scalar/Pressure.h>
 #include <Stonefish/sensors/scalar/DVL.h>
 #include <Stonefish/sensors/scalar/Accelerometer.h>
@@ -48,6 +49,10 @@
 #include <Stonefish/sensors/scalar/Odometry.h>
 #include <Stonefish/sensors/vision/ColorCamera.h>
 #include <Stonefish/sensors/vision/DepthCamera.h>
+#include <Stonefish/sensors/vision/ThermalCamera.h>
+#include <Stonefish/sensors/vision/OpticalFlowCamera.h>
+#include <Stonefish/sensors/vision/SegmentationCamera.h>
+#include <Stonefish/sensors/vision/EventBasedCamera.h>
 #include <Stonefish/sensors/scalar/Multibeam.h>
 #include <Stonefish/sensors/vision/Multibeam2.h>
 #include <Stonefish/sensors/vision/FLS.h>
@@ -55,6 +60,7 @@
 #include <Stonefish/sensors/vision/MSIS.h>
 #include <Stonefish/sensors/Contact.h>
 #include <Stonefish/comms/USBL.h>
+#include <Stonefish/comms/OpticalModem.h>
 #include <Stonefish/actuators/Push.h>
 #include <Stonefish/actuators/SimpleThruster.h>
 #include <Stonefish/actuators/Thruster.h>
@@ -64,6 +70,7 @@
 #include <Stonefish/actuators/Motor.h>
 #include <Stonefish/actuators/Servo.h>
 #include <Stonefish/actuators/VariableBuoyancy.h>
+#include <Stonefish/actuators/Light.h>
 #include <Stonefish/core/Robot.h>
 
 using namespace std::placeholders;
@@ -123,6 +130,11 @@ std::shared_ptr<image_transport::ImageTransport> ROS2SimulationManager::getImage
 std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::CameraInfo::SharedPtr>>& ROS2SimulationManager::getCameraMsgPrototypes()
 {
     return cameraMsgPrototypes_;
+}
+
+std::map<std::string, std::tuple<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::CameraInfo::SharedPtr, sensor_msgs::msg::Image::SharedPtr>>& ROS2SimulationManager::getDualImageCameraMsgPrototypes()
+{
+    return dualImageCameraMsgPrototypes_;
 }
 
 std::map<std::string, std::pair<sensor_msgs::msg::Image::SharedPtr, sensor_msgs::msg::Image::SharedPtr>>& ROS2SimulationManager::getSonarMsgPrototypes()
@@ -283,17 +295,63 @@ void ROS2SimulationManager::SimulationStepCompleted(Scalar timeStep)
     Comm* comm;
     while((comm = getComm(id++)) != nullptr)
     {
-        if(!comm->isNewDataAvailable())
-            continue;
-
         if(pubs_.find(comm->getName()) == pubs_.end())
             continue;
 
         switch(comm->getType())
         {
+            case CommType::ACOUSTIC:
+            {
+                std_msgs::msg::String msg;
+                std::shared_ptr<CommDataFrame> message;
+                while ((message = comm->ReadMessage()) != nullptr)
+                {
+                    msg.data = std::string(message->data.begin(), message->data.end());
+                    std::static_pointer_cast<rclcpp::Publisher<std_msgs::msg::String>>(
+                        pubs_.at(comm->getName())
+                    )->publish(msg);
+                }
+            }
+                break;
+
             case CommType::USBL:
-                interface_->PublishUSBL(pubs_.at(comm->getName()), pubs_.at(comm->getName() + "/beacon_info"), (USBL*)comm);
-                comm->MarkDataOld();
+            {
+                if(comm->isNewDataAvailable())
+                {
+                    interface_->PublishUSBL(pubs_.at(comm->getName()), pubs_.at(comm->getName() + "/beacon_info"), (USBL*)comm);
+                    comm->MarkDataOld();
+                }
+
+                std_msgs::msg::String msg;
+                std::shared_ptr<CommDataFrame> message;
+                while ((message = comm->ReadMessage()) != nullptr)
+                {
+                    msg.data = std::string(message->data.begin(), message->data.end());
+                    std::static_pointer_cast<rclcpp::Publisher<std_msgs::msg::String>>(
+                        pubs_.at(comm->getName() + "/received_data")
+                    )->publish(msg);
+                }
+            }
+                break;
+
+            case CommType::OPTICAL:
+            {
+                std_msgs::msg::Float64 msg;
+                msg.data = ((OpticalModem*)comm)->getReceptionQuality();
+                std::static_pointer_cast<rclcpp::Publisher<std_msgs::msg::Float64>>(
+                    pubs_.at(comm->getName())
+                )->publish(msg);
+
+                std_msgs::msg::String msg2;
+                std::shared_ptr<CommDataFrame> message;
+                while ((message = comm->ReadMessage()) != nullptr)
+                {
+                    msg2.data = std::string(message->data.begin(), message->data.end());
+                    std::static_pointer_cast<rclcpp::Publisher<std_msgs::msg::String>>(
+                        pubs_.at(comm->getName() + "/received_data")
+                    )->publish(msg2);
+                }
+            }
                 break;
 
             default:
@@ -802,6 +860,77 @@ void ROS2SimulationManager::DepthCameraImageReady(DepthCamera* cam)
     std::static_pointer_cast<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>>(pubs_.at(cam->getName() + "/info"))->publish(*info);
 }
 
+void ROS2SimulationManager::ThermalCameraImageReady(ThermalCamera* cam)
+{
+    //Fill in the image message
+    sensor_msgs::msg::Image::SharedPtr img = std::get<0>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    img->header.stamp = nh_->get_clock()->now();
+    memcpy(img->data.data(), (float*)cam->getImageDataPointer(), img->step * img->height);
+
+    //Fill in the info message
+    sensor_msgs::msg::CameraInfo::SharedPtr info = std::get<1>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    info->header.stamp = img->header.stamp;
+
+    //Fill in the display message
+    sensor_msgs::msg::Image::SharedPtr img2 = std::get<2>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    img2->header.stamp = img->header.stamp;
+    memcpy(img2->data.data(), (uint8_t*)cam->getDisplayDataPointer(), img2->step * img2->height);
+
+    //Publish messages
+    imgPubs_.at(cam->getName()).publish(img);
+    std::static_pointer_cast<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>>(pubs_.at(cam->getName() + "/info"))->publish(*info);
+    imgPubs_.at(cam->getName()+"/display").publish(img2);
+}
+
+void ROS2SimulationManager::OpticalFlowCameraImageReady(OpticalFlowCamera* cam)
+{
+    //Fill in the image message
+    sensor_msgs::msg::Image::SharedPtr img = std::get<0>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    img->header.stamp = nh_->get_clock()->now();
+    memcpy(img->data.data(), (float*)cam->getImageDataPointer(), img->step * img->height);
+
+    //Fill in the info message
+    sensor_msgs::msg::CameraInfo::SharedPtr info = std::get<1>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    info->header.stamp = img->header.stamp;
+
+    //Fill in the display message
+    sensor_msgs::msg::Image::SharedPtr img2 = std::get<2>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    img2->header.stamp = img->header.stamp;
+    memcpy(img2->data.data(), (uint8_t*)cam->getDisplayDataPointer(), img2->step * img2->height);
+
+    //Publish messages
+    imgPubs_.at(cam->getName()).publish(img);
+    std::static_pointer_cast<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>>(pubs_.at(cam->getName() + "/info"))->publish(*info);
+    imgPubs_.at(cam->getName()+"/display").publish(img2);
+}
+
+void ROS2SimulationManager::SegmentationCameraImageReady(SegmentationCamera* cam)
+{
+    //Fill in the image message
+    sensor_msgs::msg::Image::SharedPtr img = std::get<0>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    img->header.stamp = nh_->get_clock()->now();
+    memcpy(img->data.data(), (uint16_t*)cam->getImageDataPointer(), img->step * img->height);
+
+    //Fill in the info message
+    sensor_msgs::msg::CameraInfo::SharedPtr info = std::get<1>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    info->header.stamp = img->header.stamp;
+
+    //Fill in the display message
+    sensor_msgs::msg::Image::SharedPtr img2 = std::get<2>(dualImageCameraMsgPrototypes_[cam->getName()]);
+    img2->header.stamp = img->header.stamp;
+    memcpy(img2->data.data(), (uint8_t*)cam->getDisplayDataPointer(), img2->step * img2->height);
+
+    //Publish messages
+    imgPubs_.at(cam->getName()).publish(img);
+    std::static_pointer_cast<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>>(pubs_.at(cam->getName() + "/info"))->publish(*info);
+    imgPubs_.at(cam->getName()+"/display").publish(img2);
+}
+
+void ROS2SimulationManager::EventBasedCameraOutputReady(EventBasedCamera* cam)
+{
+    interface_->PublishEventBasedCamera(pubs_.at(cam->getName()), cam);
+}
+
 void ROS2SimulationManager::Multibeam2ScanReady(Multibeam2* mb)
 {
     interface_->PublishMultibeam2(pubs_.at(mb->getName()), mb);
@@ -854,9 +983,32 @@ void ROS2SimulationManager::MSISScanReady(MSIS* msis)
     disp->header.stamp = img->header.stamp;
     memcpy(disp->data.data(), (uint8_t*)msis->getDisplayDataPointer(), disp->step * disp->height);
 
+    //Fill in the laser scan message
+    Scalar currentAngle = (msis->getCurrentRotationStep() * msis->getRotationStepAngle()) * M_PI / 180.0;
+    unsigned int currentBeamIndex = msis->getCurrentBeamIndex();
+
+    sensor_msgs::msg::LaserScan laserscan;
+    laserscan.header.stamp = img->header.stamp;
+    laserscan.header.frame_id = msis->getName();
+    laserscan.angle_min = currentAngle;
+    laserscan.angle_max = currentAngle;
+    laserscan.angle_increment = 0.0;
+    laserscan.time_increment = 0.0;
+    laserscan.range_min = msis->getRangeMin();
+    laserscan.range_max = msis->getRangeMax();
+    laserscan.ranges.resize(img->height);
+    laserscan.intensities.resize(img->height);
+
+    for(unsigned int i=0; i<img->height; ++i)
+    {
+        laserscan.ranges[i] = (laserscan.range_max - laserscan.range_min) * (img->height-1-i)/Scalar(img->height-1) + laserscan.range_min;
+        laserscan.intensities[i] = img->data[img->step * i + currentBeamIndex];
+    }
+
     //Publish messages
     imgPubs_.at(msis->getName()).publish(img);
     imgPubs_.at(msis->getName() + "/display").publish(disp);
+    std::static_pointer_cast<rclcpp::Publisher<sensor_msgs::msg::LaserScan>>(pubs_.at(msis->getName() + "/beam"))->publish(laserscan);
 }
 
 void ROS2SimulationManager::EnableCurrentsService(const std_srvs::srv::Trigger::Request::SharedPtr req, 
@@ -964,6 +1116,11 @@ void ROS2SimulationManager::PushCallback(const std_msgs::msg::Float64::SharedPtr
 void ROS2SimulationManager::VBSCallback(const std_msgs::msg::Float64::SharedPtr msg, VariableBuoyancy* act)
 {
     act->setFlowRate(msg->data);
+}
+
+void ROS2SimulationManager::CommCallback(const std_msgs::msg::String::SharedPtr msg, Comm* comm)
+{
+    comm->SendMessage(msg->data);
 }
 
 void ROS2SimulationManager::SuctionCupService(const std_srvs::srv::SetBool::Request::SharedPtr req,
@@ -1181,12 +1338,32 @@ void ROS2SimulationManager::JointGroupCallback(const std_msgs::msg::Float64Multi
     }
 }
 
-void ROS2SimulationManager::JointBreakService(const std_srvs::srv::Trigger::Request::SharedPtr req, 
-                                                std_srvs::srv::Trigger::Response::SharedPtr res, Joint* j)
+void ROS2SimulationManager::GlueService(const std_srvs::srv::SetBool::Request::SharedPtr req,
+    std_srvs::srv::SetBool::Response::SharedPtr res, FixedJoint* fix)
 {
-    (void)req;
-    j->RemoveFromSimulation(this);
-    res->message = "Joint '" + j->getName() + "' broken.";
+    if(req->data)
+    {
+        fix->RemoveFromSimulation(this);
+        fix->UpdateDefinition();
+        fix->AddToSimulation(this);
+        res->message = "Glue activated.";
+    }
+    else
+    {
+        fix->RemoveFromSimulation(this);  
+        res->message = "Glue deactivated.";
+    }
+    res->success = true;
+}
+
+void ROS2SimulationManager::LightService(const std_srvs::srv::SetBool::Request::SharedPtr req,
+    std_srvs::srv::SetBool::Response::SharedPtr res, Light* light)
+{
+    light->Switch(req->data);
+    if(req->data)
+        res->message = "Light turned on.";
+    else
+        res->message = "Light turned off.";
     res->success = true;
 }
 
